@@ -24,18 +24,81 @@ load_dotenv()
 # 핸드폰/클라우드 버전: Streamlit Cloud의 Secrets에 NVIDIA_API_KEY를 넣으세요.
 # 그래도 코드에 직접 넣고 싶다면 아래 기본값 YOUR_API_KEY를 실제 키로 바꾸면 됩니다.
 # =========================================================
-def get_config_value(name: str, default: str) -> str:
-    """로컬 .env, Streamlit Cloud secrets 둘 다 지원합니다."""
-    env_value = os.getenv(name)
-    if env_value:
-        return env_value
+CONFIG_SECRET_ALIASES = {
+    "NVIDIA_API_KEY": [
+        ("NVIDIA_API_KEY",),
+        ("nvidia", "api_key"),
+        ("nvidia", "NVIDIA_API_KEY"),
+    ],
+    "NVIDIA_BASE_URL": [
+        ("NVIDIA_BASE_URL",),
+        ("nvidia", "base_url"),
+        ("nvidia", "NVIDIA_BASE_URL"),
+    ],
+    "NVIDIA_MODEL": [
+        ("NVIDIA_MODEL",),
+        ("nvidia", "model"),
+        ("nvidia", "NVIDIA_MODEL"),
+    ],
+    "NVIDIA_MAX_TOKENS": [
+        ("NVIDIA_MAX_TOKENS",),
+        ("nvidia", "max_tokens"),
+        ("nvidia", "NVIDIA_MAX_TOKENS"),
+    ],
+    "NVIDIA_TIMEOUT_SECONDS": [
+        ("NVIDIA_TIMEOUT_SECONDS",),
+        ("nvidia", "timeout_seconds"),
+        ("nvidia", "NVIDIA_TIMEOUT_SECONDS"),
+    ],
+}
+
+
+def _read_streamlit_secret_path(path: tuple) -> Optional[str]:
+    """Streamlit Cloud Secrets 값을 안전하게 읽습니다.
+
+    flat 방식 예: NVIDIA_API_KEY = "nvapi-..."
+    nested 방식 예: [nvidia] api_key = "nvapi-..."
+    둘 다 지원합니다.
+    """
     try:
-        secret_value = st.secrets.get(name)
-        if secret_value:
-            return str(secret_value)
+        current: Any = st.secrets
+        for key in path:
+            if hasattr(current, "get"):
+                current = current.get(key)
+            else:
+                current = current[key]
+            if current is None:
+                return None
+        value = str(current).strip()
+        return value or None
     except Exception:
-        pass
-    return default
+        return None
+
+
+def get_streamlit_secret_value(name: str) -> Optional[str]:
+    for path in CONFIG_SECRET_ALIASES.get(name, [(name,)]):
+        value = _read_streamlit_secret_path(path)
+        if value:
+            return value
+    return None
+
+
+def get_config_value_and_source(name: str, default: str) -> Tuple[str, str]:
+    """Streamlit Cloud Secrets를 우선하고, 없으면 로컬 .env/환경변수를 사용합니다."""
+    secret_value = get_streamlit_secret_value(name)
+    if secret_value:
+        return secret_value, "secrets"
+
+    env_value = os.getenv(name)
+    if env_value and str(env_value).strip():
+        return str(env_value).strip(), "env"
+
+    return default, "default"
+
+
+def get_config_value(name: str, default: str) -> str:
+    value, _source = get_config_value_and_source(name, default)
+    return value
 
 
 def get_int_config_value(name: str, default: int, min_value: int, max_value: int) -> int:
@@ -48,7 +111,7 @@ def get_int_config_value(name: str, default: int, min_value: int, max_value: int
     return max(min_value, min(max_value, value))
 
 
-DEFAULT_NVIDIA_API_KEY = get_config_value("NVIDIA_API_KEY", "YOUR_API_KEY")
+DEFAULT_NVIDIA_API_KEY, DEFAULT_NVIDIA_API_KEY_SOURCE = get_config_value_and_source("NVIDIA_API_KEY", "YOUR_API_KEY")
 DEFAULT_BASE_URL = get_config_value("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 DEFAULT_MODEL = get_config_value("NVIDIA_MODEL", "minimaxai/minimax-m3")
 # MiniMax-M3는 max_tokens를 너무 크게 잡으면 무료 엔드포인트에서 응답이 늦어질 수 있습니다.
@@ -1816,7 +1879,7 @@ def generate_with_nvidia(
         api_key = api_key.split(None, 1)[1].strip()
 
     if not api_key or api_key == "YOUR_API_KEY":
-        raise RuntimeError("NVIDIA API 키가 입력되지 않았습니다. .env 파일 또는 왼쪽 사이드바의 YOUR_API_KEY를 실제 nvapi- 키로 바꿔주세요.")
+        raise RuntimeError("NVIDIA API 키가 입력되지 않았습니다. Streamlit Cloud는 App settings → Secrets에 NVIDIA_API_KEY를 넣고, PC는 .env 파일의 NVIDIA_API_KEY를 실제 nvapi- 키로 바꿔주세요.")
 
     effective_base_url, _base_note = normalize_nvidia_base_url(base_url)
     effective_base_url = clean_text(effective_base_url).rstrip("/")
@@ -2063,7 +2126,22 @@ def main() -> None:
         st.divider()
 
         st.header("NVIDIA API 설정")
-        api_key = st.text_input("NVIDIA API Key", value=DEFAULT_NVIDIA_API_KEY, type="password", help="PC는 .env 파일, 핸드폰 클라우드 버전은 Streamlit Secrets, 또는 여기에 직접 입력")
+        api_key_is_saved = DEFAULT_NVIDIA_API_KEY_SOURCE in ["secrets", "env"] and DEFAULT_NVIDIA_API_KEY != "YOUR_API_KEY"
+        if DEFAULT_NVIDIA_API_KEY_SOURCE == "secrets":
+            st.success("Streamlit Secrets에서 NVIDIA_API_KEY를 불러왔습니다. 화면에 키를 노출하지 않습니다.")
+        elif DEFAULT_NVIDIA_API_KEY_SOURCE == "env":
+            st.info("로컬 .env/환경변수에서 NVIDIA_API_KEY를 불러왔습니다.")
+        else:
+            st.warning("아직 NVIDIA_API_KEY가 설정되지 않았습니다. Streamlit Cloud에서는 Secrets에 넣어주세요.")
+
+        api_key_override = st.text_input(
+            "NVIDIA API Key 직접 입력/임시 교체",
+            value="",
+            type="password",
+            placeholder="Secrets 또는 .env에 저장했다면 비워두세요",
+            help="Streamlit Cloud에서는 App settings → Secrets에 저장하는 것을 추천합니다. 여기에 입력한 값은 현재 실행 중인 화면에서만 우선 사용합니다.",
+        )
+        api_key = clean_text(api_key_override) or DEFAULT_NVIDIA_API_KEY
         base_url = st.text_input("base_url", value=autosave_value("base_url", DEFAULT_BASE_URL), key="base_url")
         effective_base_url, base_note = normalize_nvidia_base_url(base_url)
         if base_note:
@@ -2568,25 +2646,11 @@ def main() -> None:
                 st.session_state["selected_title"] = selected_title
                 st.session_state["edited_text"] = edited_text
                 st.divider()
-                c_auto1, c_auto2 = st.columns(2)
-                with c_auto1:
-                    attach_media = st.checkbox("사진/동영상 자동 업로드도 시도", value=False, help="네이버 편집기 구조가 바뀌면 실패할 수 있습니다. 실패해도 제목/본문은 입력됩니다.")
-                with c_auto2:
-                    st.markdown(f"[네이버 글쓰기 화면 직접 열기]({naver_write_url})")
-                if st.button("미리보기 내용으로 네이버 블로그에 작성하기", type="primary", use_container_width=True):
-                    try:
-                        with st.spinner("Chrome을 열고 네이버 블로그 글쓰기 화면에 입력하는 중입니다. 로그인 화면이 나오면 직접 로그인하세요."):
-                            result = write_to_naver_blog(selected_title, edited_text, uploaded_photos or [], uploaded_videos or [], naver_write_url, attach_media=attach_media)
-                            st.session_state["naver_result"] = result
-                            st.success(result)
-                    except Exception as exc:
-                        st.error(f"네이버 자동 입력 중 오류가 발생했습니다: {exc}")
-                        st.info("오류가 나면 아래 복사 버튼으로 제목/본문을 복사한 뒤 네이버 글쓰기 화면에 직접 붙여넣어 주세요.")
-                if st.session_state.get("naver_result"):
-                    st.info(st.session_state["naver_result"])
-                st.divider()
+                st.warning("핸드폰 단독/Streamlit Cloud 버전은 보안상 네이버 편집기 안에 자동으로 글을 주입할 수 없습니다. 대신 제목/본문을 복사하고 네이버 글쓰기 화면을 바로 여는 방식으로 사용하세요. PC버전은 Chrome 자동입력을 지원합니다.")
+                st.markdown(f"[네이버 글쓰기 화면 열기]({naver_write_url})")
                 copy_button("제목 복사", selected_title, "copy_title")
                 copy_button("본문 복사", edited_text, "copy_edited_body")
+                st.caption("핸드폰에서는 제목 복사 → 네이버 글쓰기 제목칸 붙여넣기 → 본문 복사 → 본문칸 붙여넣기 순서로 쓰면 됩니다. 사진/동영상은 네이버 앱이나 모바일 웹 편집기에서 직접 업로드하세요.")
             else:
                 st.info("먼저 왼쪽에서 정보를 입력하고 생성하기를 눌러주세요.")
 
