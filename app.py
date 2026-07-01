@@ -1989,6 +1989,300 @@ def generate_with_nvidia(
 
 
 # =========================================================
+# NVIDIA API 상태 진단/키 확인 도우미
+# =========================================================
+def mask_api_key(api_key: str) -> str:
+    """API 키를 화면에 안전하게 표시하기 위한 마스킹 문자열을 만듭니다."""
+    key = clean_text(api_key)
+    if not key or key == "YOUR_API_KEY":
+        return "설정 안 됨"
+    if key.lower().startswith("bearer "):
+        key = key.split(None, 1)[1].strip()
+    if len(key) <= 14:
+        return key[:4] + "..." + key[-3:]
+    return key[:8] + "..." + key[-6:]
+
+
+def normalize_api_key_for_request(api_key: str) -> str:
+    """사용자가 Bearer까지 붙여 넣어도 실제 요청에는 nvapi- 키만 사용합니다."""
+    key = clean_text(api_key)
+    if key.lower().startswith("bearer "):
+        key = key.split(None, 1)[1].strip()
+    return key
+
+
+def key_source_label(source: str) -> str:
+    mapping = {
+        "secrets": "Streamlit Secrets",
+        "env": ".env / 환경변수",
+        "default": "기본값(YOUR_API_KEY)",
+        "input": "화면 직접 입력",
+    }
+    return mapping.get(source, source or "알 수 없음")
+
+
+def diagnose_nvidia_api(
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout_seconds: int = 45,
+) -> Dict[str, Any]:
+    """NVIDIA API 키/주소/모델 상태를 짧은 테스트 요청으로 진단합니다."""
+    result: Dict[str, Any] = {
+        "ok": False,
+        "level": "error",
+        "title": "진단 전",
+        "message": "아직 API 연결 테스트를 실행하지 않았습니다.",
+        "suggestion": "API 연결 테스트 버튼을 눌러주세요.",
+        "status_code": None,
+        "elapsed_seconds": None,
+        "base_url": clean_text(base_url),
+        "invoke_url": "",
+        "model": clean_text(model) or DEFAULT_MODEL,
+        "key_masked": mask_api_key(api_key),
+        "raw_excerpt": "",
+    }
+
+    try:
+        import requests
+    except Exception as exc:
+        result.update({
+            "title": "requests 패키지 없음",
+            "message": "requests 패키지가 설치되어 있지 않아 API 테스트를 할 수 없습니다.",
+            "suggestion": "requirements.txt 설치 또는 `pip install requests`를 실행하세요.",
+            "raw_excerpt": str(exc)[:500],
+        })
+        return result
+
+    key = normalize_api_key_for_request(api_key)
+    if not key or key == "YOUR_API_KEY":
+        result.update({
+            "title": "API 키 미설정",
+            "message": "현재 적용된 NVIDIA_API_KEY가 없습니다.",
+            "suggestion": "Streamlit Cloud에서는 App settings → Secrets에 NVIDIA_API_KEY를 넣고, PC에서는 .env에 nvapi-로 시작하는 키를 넣어주세요.",
+        })
+        return result
+
+    if not key.startswith("nvapi-"):
+        result.update({
+            "level": "warning",
+            "title": "API 키 형식 확인 필요",
+            "message": "NVIDIA API 키는 보통 nvapi-로 시작합니다. 현재 키 형식이 다릅니다.",
+            "suggestion": "NVIDIA에서 새 키를 복사할 때 Bearer 없이 nvapi-로 시작하는 값만 넣었는지 확인하세요. 그래도 테스트는 계속 시도합니다.",
+        })
+
+    effective_base_url, base_note = normalize_nvidia_base_url(base_url)
+    effective_base_url = clean_text(effective_base_url).rstrip("/")
+    if effective_base_url.endswith("/chat/completions"):
+        invoke_url = effective_base_url
+    else:
+        invoke_url = f"{effective_base_url}/chat/completions"
+    result["base_url"] = effective_base_url
+    result["invoke_url"] = invoke_url
+    if base_note:
+        result["base_url_note"] = base_note
+
+    try:
+        safe_timeout = int(timeout_seconds)
+    except Exception:
+        safe_timeout = 45
+    safe_timeout = max(15, min(90, safe_timeout))
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": clean_text(model) or DEFAULT_MODEL,
+        "messages": [
+            {"role": "user", "content": "API 연결 테스트입니다. 한국어로 '정상'이라고만 답해줘."}
+        ],
+        "max_tokens": 32,
+        "temperature": 0.1,
+        "top_p": 0.95,
+        "stream": False,
+    }
+
+    start = time.time()
+    try:
+        response = requests.post(invoke_url, headers=headers, json=payload, timeout=(10, safe_timeout))
+        elapsed = round(time.time() - start, 2)
+        result["elapsed_seconds"] = elapsed
+        result["status_code"] = response.status_code
+        text_excerpt = response.text[:900] if response.text else ""
+        result["raw_excerpt"] = text_excerpt
+
+        if response.status_code == 200:
+            try:
+                data = response.json()
+            except Exception:
+                result.update({
+                    "level": "warning",
+                    "title": "응답은 왔지만 JSON 파싱 실패",
+                    "message": "서버 응답은 200이지만 JSON으로 읽지 못했습니다.",
+                    "suggestion": "잠시 후 다시 테스트하거나 NVIDIA 상태를 확인하세요.",
+                })
+                return result
+
+            choices = data.get("choices") or []
+            if choices:
+                content = ((choices[0].get("message") or {}).get("content") or "").strip()
+                usage = data.get("usage") or {}
+                result.update({
+                    "ok": True,
+                    "level": "success",
+                    "title": "API 정상 연결",
+                    "message": f"NVIDIA API가 정상 응답했습니다. 응답시간: {elapsed}초",
+                    "suggestion": "이 상태면 '생성하기'를 눌러 블로그 글을 만들 수 있습니다. 글 생성이 느리면 AI 응답 길이 제한을 낮춰보세요.",
+                    "test_reply": content,
+                    "usage": usage,
+                })
+                return result
+
+            result.update({
+                "level": "warning",
+                "title": "응답은 왔지만 choices 없음",
+                "message": "API 키와 주소는 어느 정도 맞지만, 모델 응답 형식이 예상과 다릅니다.",
+                "suggestion": "모델명을 확인하거나 잠시 후 다시 테스트하세요.",
+            })
+            return result
+
+        # 오류 응답 상세 분석
+        detail = ""
+        try:
+            err = response.json()
+            detail = err.get("detail") or err.get("message") or err.get("title") or str(err)
+        except Exception:
+            detail = response.text[:500]
+
+        status_messages = {
+            400: ("요청 형식 또는 모델명 문제", "모델명이 맞는지, payload 형식이 맞는지 확인하세요. NVIDIA_MODEL=minimaxai/minimax-m3 값을 먼저 사용해보세요."),
+            401: ("API 키 인증 실패", "키가 틀렸거나 만료됐거나, Bearer를 잘못 넣었을 수 있습니다. 새 nvapi- 키를 발급받아 Secrets 또는 .env에 다시 넣으세요."),
+            403: ("권한 또는 모델 접근 문제", "API 키는 맞지만 현재 계정/키가 해당 모델을 사용할 권한이 없을 수 있습니다. NVIDIA 모델 페이지에서 같은 모델로 새 키를 발급해보세요."),
+            404: ("API 주소 또는 엔드포인트 문제", "base_url은 https://integrate.api.nvidia.com/v1 로 두세요. 브라우저로 접속하면 404가 뜰 수 있지만 프로그램 호출은 /chat/completions로 보내야 합니다."),
+            408: ("요청 시간초과", "잠시 후 다시 시도하거나 API 대기시간을 늘려보세요."),
+            429: ("요청 제한 또는 무료 사용량 문제", "짧은 시간에 너무 많이 요청했거나 무료 한도/속도 제한에 걸렸을 수 있습니다. 잠시 후 다시 시도하세요."),
+        }
+        title, suggestion = status_messages.get(response.status_code, (f"API 오류 {response.status_code}", "오류 상세를 확인하고 base_url, 모델명, API 키 상태를 점검하세요."))
+        if 500 <= response.status_code <= 599:
+            title = "NVIDIA 서버 측 오류"
+            suggestion = "내 설정 문제가 아닐 수 있습니다. 잠시 후 다시 시도하세요."
+
+        result.update({
+            "level": "error",
+            "title": title,
+            "message": detail,
+            "suggestion": suggestion,
+        })
+        return result
+
+    except requests.exceptions.ReadTimeout as exc:
+        result.update({
+            "level": "error",
+            "title": "응답 시간초과",
+            "message": f"NVIDIA 서버가 {safe_timeout}초 안에 응답하지 않았습니다.",
+            "suggestion": "API 자체가 느리거나 일시적으로 막힌 상태일 수 있습니다. 잠시 후 다시 시도하고, 글 생성 시 max_tokens를 낮춰보세요.",
+            "raw_excerpt": str(exc)[:500],
+        })
+        return result
+    except requests.exceptions.ConnectTimeout as exc:
+        result.update({
+            "level": "error",
+            "title": "연결 시간초과",
+            "message": "NVIDIA 서버에 연결하는 단계에서 시간이 초과되었습니다.",
+            "suggestion": "인터넷 연결, 회사/학교 방화벽, VPN 상태를 확인하세요.",
+            "raw_excerpt": str(exc)[:500],
+        })
+        return result
+    except requests.exceptions.ConnectionError as exc:
+        result.update({
+            "level": "error",
+            "title": "연결 실패",
+            "message": "NVIDIA API 서버에 연결하지 못했습니다.",
+            "suggestion": "인터넷 연결, base_url, 방화벽/VPN을 확인하세요.",
+            "raw_excerpt": str(exc)[:500],
+        })
+        return result
+    except Exception as exc:
+        result.update({
+            "level": "error",
+            "title": "알 수 없는 테스트 오류",
+            "message": str(exc),
+            "suggestion": "오류 내용을 복사해서 확인해보세요.",
+            "raw_excerpt": str(exc)[:500],
+        })
+        return result
+
+
+def render_api_diagnostic_panel(
+    api_key: str,
+    api_key_source: str,
+    base_url: str,
+    effective_base_url: str,
+    model: str,
+    timeout_seconds: int,
+) -> None:
+    """사이드바에서 API 상태와 키 확인 UI를 보여줍니다."""
+    clean_key = normalize_api_key_for_request(api_key)
+    st.subheader("API 상태판")
+    st.caption("키/주소/모델이 정상인지 생성 전에 확인할 수 있습니다.")
+
+    st.write(f"키 출처: **{key_source_label(api_key_source)}**")
+    st.write(f"키 상태: **{mask_api_key(clean_key)}**")
+    if clean_key and clean_key != "YOUR_API_KEY":
+        st.text_input(
+            "현재 적용 API 키 확인",
+            value=clean_key,
+            type="password",
+            help="오른쪽 눈 아이콘을 누르면 전체 키를 볼 수 있습니다. 공개 Streamlit 앱에서는 다른 사람에게 키가 보일 수 있으니 주의하세요.",
+        )
+        st.caption("눈 아이콘으로 전체 키를 볼 수 있습니다. 앱을 공개로 배포했다면 이 기능은 끄거나 사용자를 제한하는 것이 안전합니다.")
+    else:
+        st.warning("현재 적용된 API 키가 없습니다.")
+
+    with st.expander("현재 API 설정 보기", expanded=False):
+        st.write(f"base_url: `{effective_base_url or base_url}`")
+        invoke_url = (effective_base_url or base_url or "").rstrip("/")
+        if invoke_url and not invoke_url.endswith("/chat/completions"):
+            invoke_url = invoke_url + "/chat/completions"
+        st.write(f"실제 호출 주소: `{invoke_url}`")
+        st.write(f"model: `{model}`")
+
+    if st.button("API 연결 테스트", use_container_width=True, key="nvidia_api_diagnose_btn"):
+        with st.spinner("NVIDIA API 연결을 테스트하는 중입니다..."):
+            st.session_state["nvidia_api_diagnostic"] = diagnose_nvidia_api(
+                api_key=clean_key,
+                base_url=base_url,
+                model=model,
+                timeout_seconds=min(90, max(15, int(timeout_seconds or 45))),
+            )
+
+    diag = st.session_state.get("nvidia_api_diagnostic")
+    if diag:
+        level = diag.get("level")
+        title = diag.get("title") or "진단 결과"
+        message = diag.get("message") or ""
+        suggestion = diag.get("suggestion") or ""
+        if level == "success":
+            st.success(f"{title}\n\n{message}")
+        elif level == "warning":
+            st.warning(f"{title}\n\n{message}")
+        else:
+            st.error(f"{title}\n\n{message}")
+        if suggestion:
+            st.info(suggestion)
+        with st.expander("진단 상세 보기", expanded=False):
+            safe_diag = dict(diag)
+            safe_diag.pop("raw_excerpt", None)
+            safe_diag["api_key"] = mask_api_key(clean_key)
+            st.json(safe_diag)
+            raw = clean_text(diag.get("raw_excerpt", ""))
+            if raw:
+                st.text_area("서버 응답 일부", value=raw, height=120)
+
+
+# =========================================================
 # 다운로드/백업 도우미
 # =========================================================
 
@@ -2142,6 +2436,7 @@ def main() -> None:
             help="Streamlit Cloud에서는 App settings → Secrets에 저장하는 것을 추천합니다. 여기에 입력한 값은 현재 실행 중인 화면에서만 우선 사용합니다.",
         )
         api_key = clean_text(api_key_override) or DEFAULT_NVIDIA_API_KEY
+        active_api_key_source = "input" if clean_text(api_key_override) else DEFAULT_NVIDIA_API_KEY_SOURCE
         base_url = st.text_input("base_url", value=autosave_value("base_url", DEFAULT_BASE_URL), key="base_url")
         effective_base_url, base_note = normalize_nvidia_base_url(base_url)
         if base_note:
@@ -2165,6 +2460,14 @@ def main() -> None:
             help="NVIDIA 서버 응답을 기다리는 시간입니다. 기본값은 240초입니다.",
         )
         st.caption("PC 추천 위치: .env 파일 / 핸드폰 클라우드 추천 위치: Streamlit Cloud Secrets")
+        render_api_diagnostic_panel(
+            api_key=api_key,
+            api_key_source=active_api_key_source,
+            base_url=base_url,
+            effective_base_url=effective_base_url,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
         st.divider()
 
         st.header("네이버 글쓰기")
