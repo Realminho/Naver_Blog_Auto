@@ -535,6 +535,105 @@ def collect_template_style_sources(template_links_text: str, max_links: int = 6)
     return results
 
 
+def make_template_from_analyzed_links(sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """분석된 블로그 링크 자료를 실제 저장 가능한 템플릿 데이터로 변환합니다."""
+    valid_sources = [s for s in sources if isinstance(s, dict) and not s.get("오류")]
+    all_headings: List[str] = []
+    tone_hints: List[str] = []
+    source_urls: List[str] = []
+
+    for source in valid_sources:
+        url = clean_text(source.get("URL", ""))
+        if url and url not in source_urls:
+            source_urls.append(url)
+        tone = clean_text(source.get("톤 힌트", ""))
+        if tone:
+            tone_hints.append(tone)
+        headings = source.get("소제목 후보", []) or []
+        if isinstance(headings, str):
+            headings = split_items(headings)
+        for heading in headings:
+            heading = clean_text(heading)
+            # 원문 제목을 그대로 베끼지 않도록 너무 구체적인 문구는 일반화해서 저장합니다.
+            if heading and heading not in all_headings:
+                all_headings.append(heading)
+
+    if not all_headings:
+        all_headings = [
+            "방문/사용 계기",
+            "기본 정보",
+            "핵심 특징",
+            "실제 사용감/방문 후기",
+            "좋았던 점",
+            "아쉬웠던 점",
+            "추천 대상",
+            "총평",
+        ]
+
+    # 분석 링크에서 나온 소제목은 구조 참고용으로만 쓰고, 생성 시 원문 문장 복사는 금지합니다.
+    section_lines = []
+    for i, heading in enumerate(all_headings[:9], start=1):
+        cleaned = re.sub(r"^[\d①-⑩\.\)\s-]+", "", heading).strip()
+        if not cleaned:
+            continue
+        section_lines.append(f"{i}. {cleaned}")
+    if len(section_lines) < 5:
+        defaults = ["기본 정보", "특징과 혜택", "실제 사용감", "아쉬운 점", "추천 대상", "총평"]
+        for item in defaults:
+            if not any(item in line for line in section_lines):
+                section_lines.append(f"{len(section_lines)+1}. {item}")
+
+    tone_summary = " / ".join(dict.fromkeys(tone_hints[:3])) or "자연스러운 후기체"
+    now = datetime.now().isoformat(timespec="seconds")
+    return compact_dict({
+        "title_rule": "메인 키워드 + 상황/대상 + 솔직 후기 느낌으로 제목 1개만 작성",
+        "opening_rule": f"{tone_summary} 느낌으로 시작. 독자가 공감할 상황 → 리뷰 대상 소개 → 한 줄 기대감/총평 순서로 도입",
+        "section_structure": "\n".join(section_lines[:10]),
+        "photo_video_rule": "도입부 뒤 대표 사진, 특징 설명 뒤 상세 이미지, 사용감/방문 후기 중간에 실제 사진 또는 영상, 총평 전 비교/마무리 이미지를 배치",
+        "closing_rule": "추천 대상과 주의할 점을 정리한 뒤, 과장 없이 재사용/재방문/추천 의사를 자연스럽게 마무리",
+        "hashtag_rule": "메인 키워드 + 제품/장소 키워드 + 후기/추천/사용상황 키워드로 8~12개 작성",
+        "avoid_rule": "참고 블로그의 문장, 독특한 표현, 개인 경험을 그대로 복사하지 않기. 과장 광고처럼 보이는 표현 줄이기",
+        "memo": "블로그 링크를 분석해 만든 템플릿입니다. 구조와 흐름만 참고하고 내용은 새 리뷰 대상 정보로 새로 작성합니다.",
+        "source_links": source_urls,
+        "created_from": "blog_link_analysis",
+        "created_at": now,
+    })
+
+
+def render_template_preview_markdown(template_data: Dict[str, Any], sources: Optional[List[Dict[str, Any]]] = None) -> str:
+    """저장 전에 사용자가 확인할 수 있는 템플릿 미리보기 문구를 만듭니다."""
+    sources = sources or []
+    lines = ["### 분석된 블로그 구조 템플릿 미리보기", ""]
+    if template_data.get("title_rule"):
+        lines += ["**제목 규칙**", clean_text(template_data.get("title_rule")), ""]
+    if template_data.get("opening_rule"):
+        lines += ["**도입부 흐름**", clean_text(template_data.get("opening_rule")), ""]
+    if template_data.get("section_structure"):
+        lines += ["**본문 구조 / 소제목 순서**", clean_text(template_data.get("section_structure")), ""]
+    if template_data.get("photo_video_rule"):
+        lines += ["**사진·동영상 배치 방식**", clean_text(template_data.get("photo_video_rule")), ""]
+    if template_data.get("closing_rule"):
+        lines += ["**마무리 방식**", clean_text(template_data.get("closing_rule")), ""]
+    if template_data.get("hashtag_rule"):
+        lines += ["**해시태그 규칙**", clean_text(template_data.get("hashtag_rule")), ""]
+    if template_data.get("avoid_rule"):
+        lines += ["**주의할 표현**", clean_text(template_data.get("avoid_rule")), ""]
+
+    valid_sources = [s for s in sources if isinstance(s, dict) and not s.get("오류")]
+    failed_sources = [s for s in sources if isinstance(s, dict) and s.get("오류")]
+    if valid_sources or failed_sources:
+        lines += ["**분석 결과**", f"- 읽은 링크: {len(valid_sources)}개", f"- 읽지 못한 링크: {len(failed_sources)}개", ""]
+    if valid_sources:
+        lines += ["**참고한 링크**"]
+        for idx, source in enumerate(valid_sources[:6], start=1):
+            title = clean_text(source.get("페이지 제목", "")) or "제목 없음"
+            url = clean_text(source.get("URL", ""))
+            lines.append(f"{idx}. {title} — {url}")
+        lines.append("")
+    lines.append("> 저장하면 이후 글 생성 때 이 구조를 템플릿으로 불러와 사용할 수 있습니다. 원문 문장은 복사하지 않고 구조만 반영합니다.")
+    return "\n".join(lines)
+
+
 # =========================================================
 # 네이버 블로그 미리보기 / 자동 입력 도우미
 # =========================================================
@@ -2484,73 +2583,142 @@ def main() -> None:
 
     with col_input:
         st.subheader("0. 블로그 템플릿")
-        st.caption("자주 쓰는 블로그 글 구조를 저장하거나, 참고하고 싶은 블로그 링크를 여러 개 넣으면 그 구조에 맞춰 글을 작성합니다. 링크의 문장은 복사하지 않고 구조만 참고합니다.")
+        st.caption("블로그 링크를 넣으면 먼저 구조를 분석해서 템플릿 미리보기를 보여줍니다. 마음에 들면 저장하고, 그 템플릿으로 새 글을 만들 수 있습니다.")
+
         saved_templates = load_blog_templates()
         st.session_state["saved_blog_templates"] = saved_templates
-        template_names = ["선택 안 함"] + sorted(saved_templates.keys())
-        selected_template_name = st.selectbox(
-            "저장된 템플릿 불러오기",
-            template_names,
-            index=autosave_index("selected_template_name", template_names, "선택 안 함"),
-            key="selected_template_name",
-        )
-        selected_template_data = saved_templates.get(selected_template_name, {}) if selected_template_name != "선택 안 함" else {}
-        if selected_template_data:
-            with st.expander("선택한 템플릿 내용 보기", expanded=False):
-                st.code(summarize_template_data(selected_template_data) or json.dumps(selected_template_data, ensure_ascii=False, indent=2), language="markdown")
 
-        t1, t2 = st.columns(2)
-        with t1:
-            template_save_name = st.text_input("저장할 템플릿 이름", value=autosave_value("template_save_name"), placeholder="예: 제품 상세리뷰형 / 맛집 감성후기형", key="template_save_name")
-            template_title_rule = st.text_input("제목 규칙", value=autosave_value("template_title_rule"), placeholder="예: 키워드 + 솔직 후기 + 추천 대상", key="template_title_rule")
-            template_opening_rule = st.text_area("도입부 규칙", value=autosave_value("template_opening_rule"), placeholder="예: 공감 문장으로 시작 → 사용/방문 계기 → 한 줄 총평", height=78, key="template_opening_rule")
-            template_photo_video_rule = st.text_area("사진/동영상 배치 규칙", value=autosave_value("template_photo_video_rule"), placeholder="예: 도입 후 대표사진, 특징 설명 뒤 사용 영상, 총평 전 비교 사진", height=78, key="template_photo_video_rule")
-        with t2:
-            template_section_structure = st.text_area("본문 구조/소제목 순서", value=autosave_value("template_section_structure"), placeholder="예:\n1. 한 줄 총평\n2. 제품 기본 정보\n3. 특징과 혜택\n4. 실제 사용감\n5. 아쉬운 점\n6. 추천 대상\n7. 총평", height=154, key="template_section_structure")
-            template_closing_rule = st.text_area("마무리 규칙", value=autosave_value("template_closing_rule"), placeholder="예: 추천 대상 정리 → 재구매/재방문 의사 → 주의할 점", height=78, key="template_closing_rule")
-            template_hashtag_rule = st.text_input("해시태그 규칙", value=autosave_value("template_hashtag_rule"), placeholder="예: 메인키워드 1개 + 지역/제품 키워드 + 후기 키워드 총 8~10개", key="template_hashtag_rule")
-            template_avoid_rule = st.text_input("템플릿에서 피할 표현", value=autosave_value("template_avoid_rule"), placeholder="예: 과장 광고, 무조건 추천, 인생템", key="template_avoid_rule")
-
-        template_memo = st.text_area("템플릿 메모/고정 문구", value=autosave_value("template_memo"), placeholder="고정으로 넣고 싶은 안내 문구나 말투 메모가 있으면 입력", height=80, key="template_memo")
         template_reference_links = st.text_area(
-            "구조를 참고할 블로그 링크 여러 개",
+            "구조를 분석할 블로그 링크 여러 개",
             value=autosave_value("template_reference_links"),
-            placeholder="예:\nhttps://blog.naver.com/...\nhttps://m.blog.naver.com/...\n여러 개를 넣으면 공통 구조를 분석해서 반영합니다.",
-            height=92,
+            placeholder="예:\nhttps://blog.naver.com/...\nhttps://m.blog.naver.com/...\n마음에 드는 블로그 링크를 여러 개 넣으면 공통 구조를 분석합니다.",
+            height=110,
             key="template_reference_links",
         )
-        st.caption("템플릿 링크는 제품 정보가 아니라 글 구조 참고용입니다. 원문 문장은 복사하지 않고, 소제목 순서·도입/마무리 방식·사진 배치만 참고합니다.")
+        st.caption("이 링크는 제품 정보가 아니라 글 구조 참고용입니다. 원문 문장은 복사하지 않고, 문단 순서·소제목 흐름·도입/마무리 방식만 분석합니다.")
 
-        bt1, bt2 = st.columns(2)
-        with bt1:
-            if st.button("현재 템플릿 저장", use_container_width=True):
-                ok, msg = save_blog_template(template_save_name, {
-                    "title_rule": template_title_rule,
-                    "opening_rule": template_opening_rule,
-                    "section_structure": template_section_structure,
-                    "photo_video_rule": template_photo_video_rule,
-                    "closing_rule": template_closing_rule,
-                    "hashtag_rule": template_hashtag_rule,
-                    "avoid_rule": template_avoid_rule,
-                    "memo": template_memo,
-                })
-                if ok:
-                    st.success(msg)
-                else:
-                    st.warning(msg)
-                st.session_state["saved_blog_templates"] = load_blog_templates()
-        with bt2:
-            if selected_template_name != "선택 안 함" and st.button("선택한 템플릿 삭제", use_container_width=True):
-                ok, msg = delete_blog_template(selected_template_name)
-                if ok:
-                    st.success(msg)
-                    st.session_state["selected_template_name"] = "선택 안 함"
-                else:
-                    st.warning(msg)
-                st.session_state["saved_blog_templates"] = load_blog_templates()
-                st.rerun()
+        analyzed_template_data = st.session_state.get("analyzed_template_data", {})
+        analyzed_template_preview = st.session_state.get("analyzed_template_preview", "")
+        analyzed_template_sources = st.session_state.get("template_style_sources", [])
 
-        active_template_data = selected_template_data or compact_dict({
+        ac1, ac2 = st.columns([1.25, 1])
+        with ac1:
+            if st.button("링크 분석해서 템플릿 미리보기", type="secondary", use_container_width=True):
+                template_urls = split_urls(template_reference_links)
+                if not template_urls:
+                    st.warning("분석할 블로그 링크를 먼저 입력해주세요.")
+                else:
+                    with st.spinner("블로그 링크의 구조를 분석하는 중입니다..."):
+                        template_style_sources = collect_template_style_sources(template_reference_links, max_links=6)
+                    analyzed_template_data = make_template_from_analyzed_links(template_style_sources)
+                    analyzed_template_preview = render_template_preview_markdown(analyzed_template_data, template_style_sources)
+                    st.session_state["template_style_sources"] = template_style_sources
+                    st.session_state["analyzed_template_data"] = analyzed_template_data
+                    st.session_state["analyzed_template_preview"] = analyzed_template_preview
+                    st.session_state["last_analyzed_template_links"] = "\n".join(template_urls)
+                    if not clean_text(st.session_state.get("template_save_name", "")):
+                        st.session_state["template_save_name"] = f"링크분석템플릿_{datetime.now().strftime('%m%d_%H%M')}"
+                    failed_template_count = sum(1 for item in template_style_sources if item.get("오류"))
+                    if failed_template_count:
+                        st.info(f"템플릿 링크 {len(template_urls)}개 중 {failed_template_count}개는 구조를 읽지 못했습니다. 읽힌 링크만 미리보기에 반영했습니다.")
+                    else:
+                        st.success("블로그 구조 분석이 완료되었습니다. 아래 미리보기를 확인해주세요.")
+        with ac2:
+            st.info("추천 흐름: 링크 입력 → 미리보기 확인 → 마음에 들면 저장 → 글 생성")
+
+        use_analyzed_template = False
+        if analyzed_template_data:
+            with st.container(border=True):
+                st.markdown(analyzed_template_preview or render_template_preview_markdown(analyzed_template_data, analyzed_template_sources))
+                use_analyzed_template = st.checkbox(
+                    "이번 글 생성에 이 분석 템플릿 바로 적용",
+                    value=bool(st.session_state.get("use_analyzed_template", True)),
+                    key="use_analyzed_template",
+                )
+                save_cols = st.columns([1.3, 1])
+                with save_cols[0]:
+                    template_save_name = st.text_input(
+                        "이 분석 결과를 저장할 템플릿 이름",
+                        value=autosave_value("template_save_name", st.session_state.get("template_save_name", "")),
+                        placeholder="예: 운동기구 리뷰형 / 맛집 상세후기형",
+                        key="template_save_name",
+                    )
+                with save_cols[1]:
+                    st.write("")
+                    st.write("")
+                    if st.button("미리보기 템플릿 저장", type="primary", use_container_width=True):
+                        ok, msg = save_blog_template(template_save_name, analyzed_template_data)
+                        if ok:
+                            st.success(msg)
+                            st.session_state["saved_blog_templates"] = load_blog_templates()
+                        else:
+                            st.warning(msg)
+        else:
+            template_save_name = st.text_input(
+                "저장할 템플릿 이름",
+                value=autosave_value("template_save_name"),
+                placeholder="링크 분석 후 자동으로 채워지거나, 직접 입력 템플릿 저장 때 사용됩니다.",
+                key="template_save_name",
+            )
+
+        with st.expander("저장한 템플릿 불러오기 / 직접 템플릿 작성", expanded=False):
+            template_names = ["선택 안 함"] + sorted(saved_templates.keys())
+            selected_template_name = st.selectbox(
+                "저장된 템플릿 불러오기",
+                template_names,
+                index=autosave_index("selected_template_name", template_names, "선택 안 함"),
+                key="selected_template_name",
+            )
+            selected_template_data = saved_templates.get(selected_template_name, {}) if selected_template_name != "선택 안 함" else {}
+            if selected_template_data:
+                st.info("저장된 템플릿을 선택했습니다. 위의 분석 템플릿 바로 적용을 끄면 이 저장 템플릿이 적용됩니다.")
+                with st.expander("선택한 템플릿 내용 보기", expanded=False):
+                    st.code(summarize_template_data(selected_template_data) or json.dumps(selected_template_data, ensure_ascii=False, indent=2), language="markdown")
+
+            st.markdown("**직접 템플릿을 만들고 싶을 때만 아래 칸을 작성하세요.**")
+            t1, t2 = st.columns(2)
+            with t1:
+                template_title_rule = st.text_input("제목 규칙", value=autosave_value("template_title_rule"), placeholder="예: 키워드 + 솔직 후기 + 추천 대상", key="template_title_rule")
+                template_opening_rule = st.text_area("도입부 규칙", value=autosave_value("template_opening_rule"), placeholder="예: 공감 문장으로 시작 → 사용/방문 계기 → 한 줄 총평", height=78, key="template_opening_rule")
+                template_photo_video_rule = st.text_area("사진/동영상 배치 규칙", value=autosave_value("template_photo_video_rule"), placeholder="예: 도입 후 대표사진, 특징 설명 뒤 사용 영상, 총평 전 비교 사진", height=78, key="template_photo_video_rule")
+            with t2:
+                template_section_structure = st.text_area("본문 구조/소제목 순서", value=autosave_value("template_section_structure"), placeholder="예:\n1. 한 줄 총평\n2. 제품 기본 정보\n3. 특징과 혜택\n4. 실제 사용감\n5. 아쉬운 점\n6. 추천 대상\n7. 총평", height=154, key="template_section_structure")
+                template_closing_rule = st.text_area("마무리 규칙", value=autosave_value("template_closing_rule"), placeholder="예: 추천 대상 정리 → 재구매/재방문 의사 → 주의할 점", height=78, key="template_closing_rule")
+                template_hashtag_rule = st.text_input("해시태그 규칙", value=autosave_value("template_hashtag_rule"), placeholder="예: 메인키워드 1개 + 지역/제품 키워드 + 후기 키워드 총 8~10개", key="template_hashtag_rule")
+                template_avoid_rule = st.text_input("템플릿에서 피할 표현", value=autosave_value("template_avoid_rule"), placeholder="예: 과장 광고, 무조건 추천, 인생템", key="template_avoid_rule")
+
+            template_memo = st.text_area("템플릿 메모/고정 문구", value=autosave_value("template_memo"), placeholder="고정으로 넣고 싶은 안내 문구나 말투 메모가 있으면 입력", height=80, key="template_memo")
+
+            bt1, bt2 = st.columns(2)
+            with bt1:
+                if st.button("직접 입력한 템플릿 저장", use_container_width=True):
+                    ok, msg = save_blog_template(template_save_name, {
+                        "title_rule": template_title_rule,
+                        "opening_rule": template_opening_rule,
+                        "section_structure": template_section_structure,
+                        "photo_video_rule": template_photo_video_rule,
+                        "closing_rule": template_closing_rule,
+                        "hashtag_rule": template_hashtag_rule,
+                        "avoid_rule": template_avoid_rule,
+                        "memo": template_memo,
+                    })
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.warning(msg)
+                    st.session_state["saved_blog_templates"] = load_blog_templates()
+            with bt2:
+                if selected_template_name != "선택 안 함" and st.button("선택한 템플릿 삭제", use_container_width=True):
+                    ok, msg = delete_blog_template(selected_template_name)
+                    if ok:
+                        st.success(msg)
+                        st.session_state["selected_template_name"] = "선택 안 함"
+                    else:
+                        st.warning(msg)
+                    st.session_state["saved_blog_templates"] = load_blog_templates()
+                    st.rerun()
+
+        manual_template_data = compact_dict({
             "title_rule": template_title_rule,
             "opening_rule": template_opening_rule,
             "section_structure": template_section_structure,
@@ -2560,6 +2728,11 @@ def main() -> None:
             "avoid_rule": template_avoid_rule,
             "memo": template_memo,
         })
+        if use_analyzed_template and analyzed_template_data:
+            active_template_data = analyzed_template_data
+            selected_template_name = "링크 분석 미리보기 템플릿"
+        else:
+            active_template_data = selected_template_data or manual_template_data
 
         st.divider()
         st.subheader("1. 기본 정보")
@@ -2837,15 +3010,23 @@ def main() -> None:
                     st.session_state["reference_sources"] = []
 
                 if template_link_count:
-                    with st.spinner("블로그 템플릿 링크의 구조를 분석하는 중입니다..."):
-                        template_style_sources = collect_template_style_sources(template_reference_links, max_links=6)
+                    current_template_links_key = "\n".join(split_urls(template_reference_links))
+                    cached_template_sources = st.session_state.get("template_style_sources", [])
+                    cached_template_links_key = clean_text(st.session_state.get("last_analyzed_template_links", ""))
+                    if cached_template_sources and cached_template_links_key == current_template_links_key:
+                        template_style_sources = cached_template_sources
+                    else:
+                        with st.spinner("블로그 템플릿 링크의 구조를 분석하는 중입니다..."):
+                            template_style_sources = collect_template_style_sources(template_reference_links, max_links=6)
+                        st.session_state["template_style_sources"] = template_style_sources
+                        st.session_state["last_analyzed_template_links"] = current_template_links_key
                     payload_for_generation["블로그 템플릿 링크 분석자료"] = template_style_sources
-                    st.session_state["template_style_sources"] = template_style_sources
                     failed_template_count = sum(1 for item in template_style_sources if item.get("오류"))
                     if failed_template_count:
                         st.info(f"템플릿 링크 {template_link_count}개 중 {failed_template_count}개는 구조를 읽지 못했습니다. 읽힌 링크만 반영합니다.")
                 else:
                     st.session_state["template_style_sources"] = []
+                    st.session_state["last_analyzed_template_links"] = ""
 
                 if detail_image_data_urls and mode == "NVIDIA API로 바로 생성":
                     st.info(f"업로드한 상세 설명/캡처 이미지 {min(len(detail_image_data_urls), 6)}장을 AI 분석에 함께 보냅니다.")
