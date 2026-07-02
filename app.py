@@ -451,10 +451,18 @@ def _looks_like_blog_heading(line: str) -> bool:
     line = clean_text(line)
     if not (3 <= len(line) <= 55):
         return False
-    bad = ["로그인", "댓글", "공감", "이웃", "블로그", "카페", "메뉴", "본문", "공유", "신고", "검색", "naver", "copyright", "http"]
+    bad = [
+        "로그인", "댓글", "공감", "이웃", "블로그", "카페", "메뉴", "본문", "공유", "신고", "검색",
+        "naver", "copyright", "자세히 보기", "레이어 닫기", "입력 내용 삭제", "아이디", "변경", "개월간",
+        "설정", "확인", "취소", "새로운 주소", "연결", "지원", "스마트에디터", "도움말",
+    ]
     if any(x.lower() in line.lower() for x in bad):
         return False
     if re.search(r"[{}<>]", line):
+        return False
+    if re.match(r"^(https?://|www\.)", line.lower()):
+        return False
+    if re.fullmatch(r"[\W_]+", line):
         return False
     # 짧은 독립 문장/문구, 번호형 소제목, 이모지 소제목 등을 후보로 봅니다.
     if re.match(r"^(\d+|[①-⑩]|[-•✔✅⭐📌#])", line):
@@ -466,8 +474,29 @@ def _looks_like_blog_heading(line: str) -> bool:
     return False
 
 
+def _template_topic_from_text(title: str, body: str) -> str:
+    text = f"{title} {body}".lower()
+    if any(k in text for k in ["맛집", "순대", "국밥", "메뉴", "식당", "카페", "커피", "음식", "웨이팅"]):
+        return "food"
+    if any(k in text for k in ["제품", "구매", "쿠팡", "스마트스토어", "사용", "배송", "운동기구", "화장품", "리뷰"]):
+        return "product"
+    if any(k in text for k in ["숙소", "호텔", "여행", "관광", "전시", "공연", "장소", "방문"]):
+        return "place"
+    return "general"
+
+
+def _general_section_roles(topic: str) -> List[str]:
+    if topic == "food":
+        return ["방문 계기와 첫인상", "위치와 기본 정보", "메뉴와 주문한 것", "맛과 분위기 후기", "좋았던 점과 아쉬운 점", "추천 대상", "총평"]
+    if topic == "product":
+        return ["사용/구매 계기", "제품 기본 정보", "핵심 특징과 혜택", "실제 사용감", "좋았던 점과 아쉬운 점", "추천 대상", "총평"]
+    if topic == "place":
+        return ["방문 계기", "위치와 이용 정보", "공간/분위기 소개", "직접 경험한 후기", "좋았던 점과 아쉬운 점", "추천 대상", "총평"]
+    return ["시작하는 이야기", "기본 정보", "핵심 특징", "직접 경험한 후기", "좋았던 점과 아쉬운 점", "추천 대상", "총평"]
+
+
 def analyze_blog_template_source(source: Dict[str, Any]) -> Dict[str, Any]:
-    """블로그 링크의 원문을 복사하지 않고 구조/톤 힌트만 뽑습니다."""
+    # 블로그 링크의 원문을 복사하지 않고 구조/톤 힌트만 뽑습니다.
     body = clean_text(source.get("본문 일부", ""))
     title = clean_text(source.get("페이지 제목", "")) or clean_text(source.get("상품명 후보", ""))
     url = clean_text(source.get("URL", ""))
@@ -487,7 +516,6 @@ def analyze_blog_template_source(source: Dict[str, Any]) -> Dict[str, Any]:
     avg_len = 0
     if lines:
         avg_len = int(sum(len(x) for x in lines[:60]) / min(len(lines), 60))
-    tone_hint = ""
     joined = " ".join(lines[:60])
     if re.search(r"했어요|좋았어요|같아요|더라고요|거든요", joined):
         tone_hint = "자연스러운 후기체/존댓말"
@@ -498,9 +526,12 @@ def analyze_blog_template_source(source: Dict[str, Any]) -> Dict[str, Any]:
     else:
         tone_hint = "정보형 또는 혼합형"
 
+    topic_hint = _template_topic_from_text(title, body)
+    role_hints = _general_section_roles(topic_hint)
     structure_hint = []
     if heading_candidates:
-        structure_hint.append("소제목 흐름: " + " → ".join(heading_candidates[:8]))
+        structure_hint.append(f"원문에서 소제목 후보 {len(heading_candidates)}개를 감지했습니다. 저장 템플릿에는 일반화된 부제목 자리로 변환합니다.")
+    structure_hint.append("일반화한 흐름: " + " → ".join(role_hints))
     if intro_sample:
         structure_hint.append("도입부 특징: " + intro_sample)
     if bullet_like:
@@ -517,7 +548,9 @@ def analyze_blog_template_source(source: Dict[str, Any]) -> Dict[str, Any]:
         "URL": url,
         "페이지 제목": title[:180],
         "톤 힌트": tone_hint,
+        "주제 힌트": topic_hint,
         "소제목 후보": heading_candidates[:10],
+        "일반화 부제목 역할": role_hints,
         "구조 분석": "\n".join(structure_hint)[:1400],
         "주의": "이 링크는 글 구조와 톤만 참고하고, 문장/표현은 그대로 복사하지 않습니다.",
     }
@@ -536,11 +569,11 @@ def collect_template_style_sources(template_links_text: str, max_links: int = 6)
 
 
 def make_template_from_analyzed_links(sources: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """분석된 블로그 링크 자료를 실제 저장 가능한 템플릿 데이터로 변환합니다."""
+    # 분석된 블로그 링크 자료를 실제 저장 가능한 템플릿 데이터로 변환합니다.
     valid_sources = [s for s in sources if isinstance(s, dict) and not s.get("오류")]
-    all_headings: List[str] = []
     tone_hints: List[str] = []
     source_urls: List[str] = []
+    topic_votes: List[str] = []
 
     for source in valid_sources:
         url = clean_text(source.get("URL", ""))
@@ -549,67 +582,58 @@ def make_template_from_analyzed_links(sources: List[Dict[str, Any]]) -> Dict[str
         tone = clean_text(source.get("톤 힌트", ""))
         if tone:
             tone_hints.append(tone)
-        headings = source.get("소제목 후보", []) or []
-        if isinstance(headings, str):
-            headings = split_items(headings)
-        for heading in headings:
-            heading = clean_text(heading)
-            # 원문 제목을 그대로 베끼지 않도록 너무 구체적인 문구는 일반화해서 저장합니다.
-            if heading and heading not in all_headings:
-                all_headings.append(heading)
+        topic = clean_text(source.get("주제 힌트", ""))
+        if topic:
+            topic_votes.append(topic)
 
-    if not all_headings:
-        all_headings = [
-            "방문/사용 계기",
-            "기본 정보",
-            "핵심 특징",
-            "실제 사용감/방문 후기",
-            "좋았던 점",
-            "아쉬웠던 점",
-            "추천 대상",
-            "총평",
-        ]
-
-    # 분석 링크에서 나온 소제목은 구조 참고용으로만 쓰고, 생성 시 원문 문장 복사는 금지합니다.
-    section_lines = []
-    for i, heading in enumerate(all_headings[:9], start=1):
-        cleaned = re.sub(r"^[\d①-⑩\.\)\s-]+", "", heading).strip()
-        if not cleaned:
-            continue
-        section_lines.append(f"{i}. {cleaned}")
-    if len(section_lines) < 5:
-        defaults = ["기본 정보", "특징과 혜택", "실제 사용감", "아쉬운 점", "추천 대상", "총평"]
-        for item in defaults:
-            if not any(item in line for line in section_lines):
-                section_lines.append(f"{len(section_lines)+1}. {item}")
+    topic = "general"
+    if topic_votes:
+        topic = max(set(topic_votes), key=topic_votes.count)
+    section_roles = _general_section_roles(topic)
+    section_lines = [f"{i}. 부제목 {i} - {role}" for i, role in enumerate(section_roles, start=1)]
 
     tone_summary = " / ".join(dict.fromkeys(tone_hints[:3])) or "자연스러운 후기체"
     now = datetime.now().isoformat(timespec="seconds")
     return compact_dict({
-        "title_rule": "메인 키워드 + 상황/대상 + 솔직 후기 느낌으로 제목 1개만 작성",
-        "opening_rule": f"{tone_summary} 느낌으로 시작. 독자가 공감할 상황 → 리뷰 대상 소개 → 한 줄 기대감/총평 순서로 도입",
-        "section_structure": "\n".join(section_lines[:10]),
-        "photo_video_rule": "도입부 뒤 대표 사진, 특징 설명 뒤 상세 이미지, 사용감/방문 후기 중간에 실제 사진 또는 영상, 총평 전 비교/마무리 이미지를 배치",
+        "title_rule": "제목 자리에는 메인 키워드 + 상황/대상 + 후기 느낌으로 제목 1개만 작성",
+        "subtitle_rule": "부제목 자리에는 한 줄 요약 또는 기대감을 짧게 작성",
+        "opening_rule": f"{tone_summary} 느낌으로 시작. 독자가 공감할 상황 → 리뷰 대상 소개 → 한 줄 총평 순서로 도입",
+        "section_structure": "\n".join(section_lines),
+        "photo_video_rule": "도입부 뒤 대표 사진 자리, 특징 설명 뒤 상세 이미지 자리, 사용감/방문 후기 중간에 실제 사진 또는 영상 자리, 총평 전 마무리 이미지 자리를 배치",
         "closing_rule": "추천 대상과 주의할 점을 정리한 뒤, 과장 없이 재사용/재방문/추천 의사를 자연스럽게 마무리",
         "hashtag_rule": "메인 키워드 + 제품/장소 키워드 + 후기/추천/사용상황 키워드로 8~12개 작성",
         "avoid_rule": "참고 블로그의 문장, 독특한 표현, 개인 경험을 그대로 복사하지 않기. 과장 광고처럼 보이는 표현 줄이기",
-        "memo": "블로그 링크를 분석해 만든 템플릿입니다. 구조와 흐름만 참고하고 내용은 새 리뷰 대상 정보로 새로 작성합니다.",
+        "memo": "블로그 링크를 분석해 만든 템플릿입니다. 미리보기에는 제목/부제목/본문/사진 자리처럼 양식으로 표시하고, 실제 글 생성 때 사용자가 입력한 리뷰 정보로 채웁니다.",
         "source_links": source_urls,
         "created_from": "blog_link_analysis",
         "created_at": now,
     })
 
 
+def _template_section_roles(template_data: Dict[str, Any]) -> List[str]:
+    raw = clean_text(template_data.get("section_structure", ""))
+    roles: List[str] = []
+    for line in raw.splitlines():
+        line = clean_text(line)
+        if not line:
+            continue
+        line = re.sub(r"^\d+[\.\)]\s*", "", line).strip()
+        line = re.sub(r"^부제목\s*\d+\s*[-–—:]\s*", "", line).strip()
+        if line and line not in roles:
+            roles.append(line)
+    return roles or _general_section_roles("general")
+
+
 def render_template_preview_markdown(template_data: Dict[str, Any], sources: Optional[List[Dict[str, Any]]] = None) -> str:
-    """저장 전에 사용자가 확인할 수 있는 템플릿 미리보기 문구를 만듭니다."""
+    # 저장 전에 사용자가 확인할 수 있는 템플릿 분석 요약입니다. 기본 화면에는 HTML 미리보기를 보여줍니다.
     sources = sources or []
-    lines = ["### 분석된 블로그 구조 템플릿 미리보기", ""]
+    lines = ["### 템플릿 분석 요약", ""]
     if template_data.get("title_rule"):
         lines += ["**제목 규칙**", clean_text(template_data.get("title_rule")), ""]
     if template_data.get("opening_rule"):
         lines += ["**도입부 흐름**", clean_text(template_data.get("opening_rule")), ""]
     if template_data.get("section_structure"):
-        lines += ["**본문 구조 / 소제목 순서**", clean_text(template_data.get("section_structure")), ""]
+        lines += ["**본문 구조 / 부제목 역할**", clean_text(template_data.get("section_structure")), ""]
     if template_data.get("photo_video_rule"):
         lines += ["**사진·동영상 배치 방식**", clean_text(template_data.get("photo_video_rule")), ""]
     if template_data.get("closing_rule"):
@@ -632,6 +656,82 @@ def render_template_preview_markdown(template_data: Dict[str, Any], sources: Opt
         lines.append("")
     lines.append("> 저장하면 이후 글 생성 때 이 구조를 템플릿으로 불러와 사용할 수 있습니다. 원문 문장은 복사하지 않고 구조만 반영합니다.")
     return "\n".join(lines)
+
+
+def render_visual_template_preview_html(template_data: Dict[str, Any], sources: Optional[List[Dict[str, Any]]] = None) -> str:
+    # 분석된 구조를 실제 네이버 블로그에 적용했을 때처럼 양식 미리보기로 보여줍니다.
+    sources = sources or []
+    roles = _template_section_roles(template_data)[:7]
+    today = datetime.now().strftime("%Y.%m.%d. %H:%M")
+    source_count = len([s for s in sources if isinstance(s, dict) and not s.get("오류")])
+    role_blocks = []
+    for idx, role in enumerate(roles, start=1):
+        safe_role = html.escape(role)
+        media = ""
+        if idx == 1:
+            media = '<div class="template-media">대표 사진 자리</div>'
+        elif idx == 3:
+            media = '<div class="template-media detail">상세 이미지 / 제품 설명 이미지 자리</div>'
+        elif idx == 4:
+            media = '<div class="template-media video">실제 사진 또는 동영상 자리</div>'
+        role_blocks.append(f"""
+        <section class="tpl-section">
+          <h2>부제목 {idx}</h2>
+          <div class="role">역할: {safe_role}</div>
+          {media}
+          <p><span class="ghost">본문 문단 자리</span> — 여기에 사용자가 입력한 제품·장소 정보, 링크에서 읽은 특징, 직접 사용한 후기 내용이 들어갑니다.</p>
+          <p><span class="ghost">경험/정보 자리</span> — 원문 문장을 복사하지 않고 새 리뷰 대상에 맞춰 자연스럽게 작성됩니다.</p>
+        </section>
+        """)
+    source_note = f"분석 링크 {source_count}개 구조 반영" if source_count else "분석 링크 구조 반영"
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body {{ margin:0; background:#f4f6f8; font-family:-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun Gothic',Arial,sans-serif; color:#222; }}
+  .wrap {{ max-width: 760px; margin: 0 auto; background:#fff; min-height:100vh; }}
+  .topbar {{ height:46px; border-bottom:1px solid #edf0f2; display:flex; align-items:center; padding:0 18px; color:#03c75a; font-weight:800; }}
+  .article {{ padding: 34px 22px 70px; }}
+  .category {{ color:#03c75a; font-size:13px; font-weight:700; margin-bottom:10px; }}
+  h1 {{ font-size:30px; line-height:1.35; margin: 0 0 10px; letter-spacing:-.4px; }}
+  .subtitle {{ font-size:17px; color:#666; margin:0 0 12px; line-height:1.7; }}
+  .meta {{ font-size:13px; color:#888; margin-bottom:28px; }}
+  h2 {{ font-size:22px; margin:34px 0 8px; line-height:1.45; }}
+  p {{ font-size:16px; line-height:1.95; margin: 10px 0; word-break:keep-all; }}
+  .role {{ display:inline-block; margin:0 0 10px; padding:5px 9px; border-radius:999px; background:#eefbf4; color:#0c8f48; font-size:12px; font-weight:700; }}
+  .ghost {{ color:#03a94f; font-weight:800; }}
+  .template-media {{ border:1px dashed #b8e5ca; background:#f7fcf9; border-radius:12px; height:170px; margin:18px 0; display:flex; align-items:center; justify-content:center; color:#0c8f48; font-weight:800; }}
+  .template-media.detail {{ background:#fbfcf7; border-color:#dce8b4; color:#718000; }}
+  .template-media.video {{ background:#f8f9fc; border-color:#c9d2ee; color:#3450a4; }}
+  .hash {{ margin-top:30px; color:#00a850; line-height:1.9; font-size:15px; }}
+  .notice {{ margin-top:24px; padding:14px 16px; background:#f7f8fa; border-radius:10px; color:#666; font-size:13px; line-height:1.7; }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">NAVER Blog 템플릿 미리보기</div>
+    <article class="article">
+      <div class="category">템플릿 · {html.escape(source_note)}</div>
+      <h1>제목 자리</h1>
+      <div class="subtitle">부제목 자리 · 한 줄 요약 또는 기대감이 들어가는 영역</div>
+      <div class="meta">작성자 · {today}</div>
+      <p><span class="ghost">도입부 자리</span> — 독자가 공감할 상황을 먼저 보여주고, 리뷰 대상을 자연스럽게 소개합니다.</p>
+      <p><span class="ghost">한 줄 총평 자리</span> — 글을 계속 읽고 싶게 만드는 짧은 기대감/요약이 들어갑니다.</p>
+      {''.join(role_blocks)}
+      <section class="tpl-section">
+        <h2>마무리 부제목</h2>
+        <p><span class="ghost">추천 대상 자리</span> — 어떤 사람에게 잘 맞는지 정리합니다.</p>
+        <p><span class="ghost">주의할 점 자리</span> — 아쉬운 점이나 참고할 점을 과장 없이 적습니다.</p>
+        <p><span class="ghost">총평 자리</span> — 재구매/재방문/추천 의사를 자연스럽게 마무리합니다.</p>
+      </section>
+      <div class="hash">#키워드1 #키워드2 #제품명또는장소명 #후기 #추천 #사용상황</div>
+      <div class="notice">이 화면은 저장 전 템플릿 양식 미리보기입니다. 실제 글 생성 시에는 “제목 자리”, “부제목 자리”, “본문 자리”가 사용자가 입력한 정보와 링크 분석 자료로 자동 채워집니다.</div>
+    </article>
+  </div>
+</body>
+</html>"""
 
 
 # =========================================================
@@ -2629,7 +2729,12 @@ def main() -> None:
         use_analyzed_template = False
         if analyzed_template_data:
             with st.container(border=True):
-                st.markdown(analyzed_template_preview or render_template_preview_markdown(analyzed_template_data, analyzed_template_sources))
+                st.markdown("#### 네이버 블로그 적용 모습 미리보기")
+                st.caption("원문 블로그의 실제 제목/소제목을 그대로 보여주지 않고, 저장할 템플릿 양식처럼 제목 자리·부제목 자리·본문 자리로 보여줍니다.")
+                visual_template_html = render_visual_template_preview_html(analyzed_template_data, analyzed_template_sources)
+                st.components.v1.html(visual_template_html, height=680, scrolling=True)
+                with st.expander("분석 요약 보기", expanded=False):
+                    st.markdown(analyzed_template_preview or render_template_preview_markdown(analyzed_template_data, analyzed_template_sources))
                 use_analyzed_template = st.checkbox(
                     "이번 글 생성에 이 분석 템플릿 바로 적용",
                     value=bool(st.session_state.get("use_analyzed_template", True)),
